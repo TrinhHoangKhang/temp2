@@ -138,6 +138,27 @@ class RPG_optimized(AbstractModel):
         else:
             self.codebook_centroids = None
             self.tokenizer.log(f'[MODEL] No codebook_centroids available')
+
+        self.model_emb_dim = self.config['n_embd']
+        self.quantizer_emb_dim = self.linear_transform.in_features
+
+        self.pre_quantizer_proj = None
+        self.post_quantizer_proj = None
+        if self.model_emb_dim != self.quantizer_emb_dim:
+            self.pre_quantizer_proj = nn.Linear(
+                self.model_emb_dim,
+                self.quantizer_emb_dim
+            ).to(self.config['device'])
+            self.post_quantizer_proj = nn.Linear(
+                self.quantizer_emb_dim,
+                self.model_emb_dim
+            ).to(self.config['device'])
+            self.tokenizer.log(
+                f'[MODEL] Added quantizer adapters: '
+                f'{self.model_emb_dim} -> {self.quantizer_emb_dim} -> {self.model_emb_dim}'
+            )
+        else:
+            self.tokenizer.log(f'[MODEL] Quantizer dim matches model dim: {self.model_emb_dim}')
     
     def _gumbel_softmax_quantize(self, embeddings, temperature=1.0):
         """
@@ -277,8 +298,14 @@ class RPG_optimized(AbstractModel):
             # Convert discrete tokens to continuous embeddings
             token_embs = self.gpt2.wte(input_tokens).mean(dim=-2)  # [B, seq_len, emb_dim]
             
+            # Optional projection to quantizer space (handles n_embd != OPQ/PCA dim)
+            if self.pre_quantizer_proj is not None:
+                token_embs_for_quantizer = self.pre_quantizer_proj(token_embs)
+            else:
+                token_embs_for_quantizer = token_embs
+
             # Apply learned rotation (pre-transform)
-            transformed_embs = self.linear_transform(token_embs)  # [B, seq_len, emb_dim]
+            transformed_embs = self.linear_transform(token_embs_for_quantizer)
             
             # Quantize with Gumbel-Softmax
             soft_codes = self._gumbel_softmax_quantize(
@@ -287,7 +314,11 @@ class RPG_optimized(AbstractModel):
             )  # [B, seq_len, n_digit, codebook_size]
             
             # Convert soft codes to embeddings
-            input_embs = self._decode_soft_codes(soft_codes)  # [B, seq_len, emb_dim]
+            input_embs = self._decode_soft_codes(soft_codes)
+
+            # Project back to GPT embedding space if needed
+            if self.post_quantizer_proj is not None:
+                input_embs = self.post_quantizer_proj(input_embs)
         else:
             # ========== STATIC QUANTIZATION PATH (original) ==========
             input_tokens = self.item_id2tokens[batch['input_ids']]
